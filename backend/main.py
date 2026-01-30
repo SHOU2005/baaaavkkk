@@ -1,6 +1,6 @@
 """
 AcuTrace - Party Ledger & Fund Flow Intelligence Platform
-Backend API Server
+Backend API Server - Fixed Version with Proper Type Preservation
 """
 
 import re
@@ -20,6 +20,8 @@ from services.entity_normalizer import EntityNormalizer
 from services.fund_flow_chain_builder import FundFlowChainBuilder
 from services.transaction_categorizer import TransactionCategorizer
 from services.export_service import ExportService
+from services.validation_engine import ValidationEngine
+from services.balance_tracker import analyze_statement_balance
 
 load_dotenv()
 
@@ -34,7 +36,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins for local network deployment
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -45,156 +47,107 @@ pdf_processor = PDFProcessor()
 entity_normalizer = EntityNormalizer()
 fund_flow_builder = FundFlowChainBuilder()
 categorizer = TransactionCategorizer()
+validation_engine = ValidationEngine()
 export_service = ExportService()
 
 SUPPORTED_EXTENSIONS = ('.xls', '.xlsx', '.pdf')
 
 
+def _safe_get_numeric(value, default=0):
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return default
+
+
+def _calculate_amount(txn):
+    """Calculate net amount from transaction"""
+    amount = _safe_get_numeric(txn.get('amount'))
+    if amount != 0:
+        return amount
+    credit = _safe_get_numeric(txn.get('credit'))
+    debit = _safe_get_numeric(txn.get('debit'))
+    if credit > 0 and debit == 0:
+        return credit
+    elif debit > 0 and credit == 0:
+        return -debit
+    elif credit > debit:
+        return credit - debit
+    elif debit > credit:
+        return -(debit - credit)
+    else:
+        return 0
+
+
+def _is_credit_transaction(txn):
+    """Check if transaction is credit (money in)"""
+    credit = _safe_get_numeric(txn.get('credit'))
+    debit = _safe_get_numeric(txn.get('debit'))
+    if credit > 0 and debit == 0:
+        return True
+    elif credit > debit:
+        return True
+    elif debit > credit:
+        return False
+    else:
+        amount = _safe_get_numeric(txn.get('amount'))
+        if amount != 0:
+            return amount > 0
+        return False
+
+
 def _extract_party_from_narration(narration: str) -> Optional[str]:
-    """
-    Extract party name from narration using comprehensive pattern matching.
-    This is the fallback method when processor-level extraction fails.
-    """
+    """Extract party name from narration"""
     if not narration or len(narration) < 2:
         return None
     
     narration = narration.upper().strip()
-    party = None
     
-    # ========== UPI PATTERNS ==========
-    upi_patterns = [
-        r'UPI/(?:CR|DR)/\d+/(.+?)/(?:OK|FAIL|PA|BI|AX|PASS)',
-        r'UPI/\d+/(.+?)/(?:OK|FAIL|PA|BI)$',
-        r'UPI-(?:CR|DR)?-?\d*-?(.+?)(?:[-/]OK|[-/]FAIL|[-/]PA|[-/]BI|$)',
-        r'@([a-zA-Z0-9]+)',
-        r'UPI[/\s]*(?:from|to|by)[/\s]*([A-Z][A-Za-z\s]{2,})',
-        r'UPI/(?:D\d+)?[/\s]*([A-Z][A-Za-z\s]{2,})',
-        r'UPI[/\s]*(?:CR|DR)[/\s]*(?:D\d+)?[/\s]*([A-Z][A-Za-z\s]{2,})',
-        r'(?:UPI|PAYTM|GPAY|PHONEPE)[/\s]*(?:CR|DR)?[/\s]*(?:D\d+)?[/\s]*([A-Z][A-Za-z\s]+?)(?:/OKPA|/OKAX|/OKBI|/OK)',
-    ]
+    # UPI patterns
+    upi_match = re.search(r'UPI/\w+/([A-Z]+)', narration)
+    if upi_match:
+        return upi_match.group(1)
     
-    for pattern in upi_patterns:
-        match = re.search(pattern, narration, re.IGNORECASE)
-        if match and match.group(1):
-            candidate = match.group(1).upper().strip()
-            candidate = ' '.join(candidate.split())
-            if len(candidate) >= 2 and candidate not in ['DR', 'CR', 'TRF', 'BY', 'TO', 'FROM']:
-                party = candidate
-                break
+    handle_match = re.search(r'@([A-Z0-9]+)', narration)
+    if handle_match:
+        return handle_match.group(1)
     
-    # ========== TRANSFER PATTERNS ==========
-    if not party:
-        transfer_patterns = [
-            r'(?:transfer|TRANSFER)\s+(?:from|to|FROM|TO)\s+([A-Z][A-Za-z\s]{2,})',
-            r'PAID\s+TO\s+([A-Z][A-Za-z\s]{2,})',
-            r'RECEIVED\s+FROM\s+([A-Z][A-Za-z\s]{2,})',
-            r'BY\s+(?:TRANSFER|NEFT|RTGS|IMPS)[:\s-]*([A-Z][A-Za-z\s]{2,})',
-            r'TRF\s+(?:TO|FROM)[:\s]*([A-Z][A-Za-z\s]{2,})',
-        ]
-        for pattern in transfer_patterns:
-            match = re.search(pattern, narration, re.IGNORECASE)
-            if match and match.group(1):
-                candidate = match.group(1).upper().strip()
-                candidate = ' '.join(candidate.split())
-                if len(candidate) >= 2:
-                    party = candidate
-                    break
+    to_match = re.search(r'TO\s+([A-Z][A-Z\s]{2,})', narration)
+    if to_match:
+        return to_match.group(1).strip()
     
-    # ========== RTGS/NEFT/IMPS PATTERNS ==========
-    if not party:
-        other_transfer_patterns = [
-            r'RTGS\s+(?:CR|DR)?[-]?\s*(?:[A-Z0-9]+[-])?\s*([A-Z][A-Za-z\s]{2,})',
-            r'NEFT\s+(?:CR|DR)?[-]?\s*(?:[A-Z0-9]+[-])?\s*([A-Z][A-Za-z\s]{2,})',
-            r'IMPS\s+(?:CR|DR)?[-]?\s*(?:[A-Z0-9]+[-])?\s*([A-Z][A-Za-z\s]{2,})',
-        ]
-        for pattern in other_transfer_patterns:
-            match = re.search(pattern, narration, re.IGNORECASE)
-            if match and match.group(1):
-                candidate = match.group(1).upper().strip()
-                candidate = ' '.join(candidate.split())
-                if len(candidate) >= 2:
-                    party = candidate
-                    break
+    from_match = re.search(r'FROM\s+([A-Z][A-Z\s]{2,})', narration)
+    if from_match:
+        return from_match.group(1).strip()
     
-    # ========== CASH/BILL PATTERNS ==========
-    if not party:
-        other_patterns = [
-            r'CASH\s+(?:DEPOSIT|WITHDRAWAL)\s*(?:AT|BY)?\s*([A-Z][A-Za-z\s]{2,})',
-            r'(?:BILL|EMI|LOAN)\s+(?:PAYMENT|REPAYMENT)[:\s]*([A-Z][A-Za-z\s]{2,})',
-            r'INSURANCE\s+(?:PREMIUM|PAYMENT)[:\s]*([A-Z][A-Za-z\s]{2,})',
-            r'SALARY\s+(?:FROM|TO)?\s*([A-Z][A-Za-z\s]{2,})',
-        ]
-        for pattern in other_patterns:
-            match = re.search(pattern, narration, re.IGNORECASE)
-            if match and match.group(1):
-                candidate = match.group(1).upper().strip()
-                candidate = ' '.join(candidate.split())
-                if len(candidate) >= 2:
-                    party = candidate
-                    break
-    
-    # ========== TO/FOR/FROM PATTERNS ==========
-    if not party:
-        to_from_patterns = [
-            r'TO\s+([A-Z][A-Za-z\s]{2,})',
-            r'FOR\s+([A-Z][A-Za-z\s]{2,})',
-            r'FROM\s+([A-Z][A-Za-z\s]{2,})',
-            r'AT\s+([A-Z][A-Za-z\s]{2,})',
-        ]
-        for pattern in to_from_patterns:
-            match = re.search(pattern, narration, re.IGNORECASE)
-            if match and match.group(1):
-                candidate = match.group(1).upper().strip()
-                candidate = re.sub(r'^(TO|FROM|FOR|AT|ON|BY|REF|NO|NEW|AC|ACC)\s*', '', candidate)
-                candidate = ' '.join(candidate.split())
-                if len(candidate) >= 2:
-                    party = candidate
-                    break
-    
-    # ========== NORMALIZE PARTY NAME ==========
-    if party:
-        # Remove business suffixes
-        suffixes = ['TRADERS', 'TRDG', 'AGENCIES', 'SERVICES', 'PVT', 'LTD', 'LIMITED',
-                   'CORP', 'INC', 'COMPANY', 'HOLDINGS', 'INDUSTRIES']
-        for suffix in suffixes:
-            party = re.sub(rf'\b{suffix}\b', '', party, flags=re.IGNORECASE)
-        
-        # Remove special characters and digits
-        party = re.sub(r'[^\w\s]', ' ', party)
-        party = re.sub(r'\b[\d]{10,}\b', '', party)
-        
-        # Clean up
-        party = ' '.join(party.split())
-        party = party.strip()
-        
-        if len(party) >= 2:
-            logger.debug(f"Party extracted from narration: '{narration[:50]}...' -> '{party}'")
-            return party
-    
-    # ========== LAST RESORT: Extract meaningful words ==========
-    if not party:
-        transaction_words = ['DEPOSIT', 'WITHDRAWAL', 'PAYMENT', 'TRANSFER', 'CREDIT', 'DEBIT',
-                           'BALANCE', 'CHARGES', 'FEE', 'TAX', 'EMI', 'BILL', 'SALARY',
-                           'INTEREST', 'DIVIDEND', 'REFUND', 'REVERSAL', 'CLEARING', 'NO', 'NUM',
-                           'BY', 'TO', 'FROM', 'FOR', 'AT', 'ON']
-        cleaned = narration
-        for word in transaction_words:
-            cleaned = re.sub(r'\b' + word + r'\b', ' ', cleaned, flags=re.IGNORECASE)
-        
-        words = cleaned.strip().split()
-        meaningful = [w for w in words if len(w) > 2 and not w.isdigit()]
-        
-        if meaningful:
-            party = ' '.join(meaningful[:3]).upper()
-            # Clean up
-            party = re.sub(r'[^\w\s]', ' ', party)
-            party = ' '.join(party.split())
-            if len(party) >= 2:
-                logger.debug(f"Party extracted (fallback): '{narration[:50]}...' -> '{party}'")
-                return party
-    
-    logger.debug(f"No party found for narration: '{narration[:50]}...'")
     return None
+
+
+def _normalize_party(party: str) -> str:
+    """Clean up party name"""
+    if not party:
+        return "UNKNOWN"
+    party = re.sub(r'[^\w\s]', ' ', party)
+    party = ' '.join(party.split()).strip()
+    return party if len(party) >= 2 else "UNKNOWN"
+
+
+def _extract_transactions_safe(processor_result) -> List[Dict[str, Any]]:
+    """Safely extract transactions from processor result"""
+    if processor_result is None:
+        return []
+    if isinstance(processor_result, list):
+        return processor_result
+    if isinstance(processor_result, tuple):
+        for item in processor_result:
+            if isinstance(item, list):
+                return item
+        return []
+    return []
 
 
 @app.get("/")
@@ -203,151 +156,122 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "service": "acutrace-party-ledger"}
+    return {"status": "healthy", "service": "acutrace"}
 
 @app.post("/api/analyze")
 async def analyze_statement(file: UploadFile = File(...)):
-    """Analyze a single bank statement for party ledger and fund flow intelligence."""
+    """Analyze a single bank statement"""
     try:
         if not file.filename.lower().endswith(SUPPORTED_EXTENSIONS):
             raise HTTPException(status_code=400, detail=f"Only {', '.join(SUPPORTED_EXTENSIONS)} files are supported")
         
         logger.info(f"Processing file: {file.filename}")
-        
         file_bytes = await file.read()
         if len(file_bytes) == 0:
             raise HTTPException(status_code=400, detail="Empty file")
         
         transactions = []
-        account_profile = {}
         
         if file.filename.lower().endswith(('.xls', '.xlsx')):
-            logger.info("Extracting transactions from Excel...")
-            try:
-                result = excel_processor.extract_transactions(file_bytes, file.filename)
-                
-                if isinstance(result, tuple) and len(result) == 2:
-                    transactions, account_profile = result
-                else:
-                    transactions = result if isinstance(result, list) else []
-                    account_profile = {}
-                
-                logger.info(f"Excel extraction returned {len(transactions)} transactions")
-            except Exception as e:
-                logger.error(f"Excel extraction error: {str(e)}")
-                raise HTTPException(status_code=400, detail=f"Failed to process Excel file: {str(e)}")
-        
+            logger.info("Extracting from Excel...")
+            result = excel_processor.extract_transactions(file_bytes, file.filename)
+            transactions = _extract_transactions_safe(result)
         elif file.filename.lower().endswith('.pdf'):
-            logger.info("Extracting transactions from PDF...")
-            try:
-                transactions = pdf_processor.extract_transactions(file_bytes)
-                logger.info(f"PDF extraction returned {len(transactions)} transactions")
-                
-                if not transactions:
-                    raise ValueError("No transactions found in PDF.")
-            except Exception as e:
-                logger.error(f"PDF extraction error: {str(e)}")
-                raise HTTPException(status_code=400, detail=f"Failed to process PDF file: {str(e)}")
+            logger.info("Extracting from PDF...")
+            result = pdf_processor.extract_transactions(file_bytes)
+            transactions = _extract_transactions_safe(result)
+            if not transactions:
+                raise ValueError("No transactions found in PDF")
         
         if not transactions or len(transactions) == 0:
-            logger.warning(f"No transactions found in {file.filename}")
-            raise HTTPException(status_code=400, detail="No transactions found. Please ensure the file contains valid bank statement data.")
+            raise HTTPException(status_code=400, detail="No transactions found")
         
-        logger.info(f"Extracted {len(transactions)} transactions from {file.filename}")
+        logger.info(f"Extracted {len(transactions)} transactions")
         
-        # Clear and reset
+        # Process transactions
         entity_normalizer.clear()
         fund_flow_builder.clear()
         
-        # Process each transaction - REGISTER PARTIES WITH ENTITY NORMALIZER
-        party_extraction_stats = {'total': len(transactions), 'found': 0, 'fallback': 0}
+        # Count credit/debit for logging
+        pdf_credits = sum(1 for t in transactions if t.get('type') == 'CREDIT')
+        pdf_debits = sum(1 for t in transactions if t.get('type') == 'DEBIT')
+        logger.info(f"From PDF: {pdf_credits} CREDIT, {pdf_debits} DEBIT")
         
         for idx, txn in enumerate(transactions):
             try:
-                # Calculate amount if not set
-                if txn.get('amount', 0) == 0:
-                    txn['amount'] = (txn.get('credit', 0) or 0) - (txn.get('debit', 0) or 0)
+                # Preserve the original type from PDF!
+                original_type = txn.get('type', 'UNKNOWN')
                 
-                # Get existing party from processor
-                existing_party = txn.get('detected_party') or txn.get('party')
+                txn['amount'] = _calculate_amount(txn)
                 description = txn.get('description', '')
-                is_credit = txn.get('credit', 0) > 0
-                amount = txn.get('amount', 0)
+                is_credit = _is_credit_transaction(txn)
+                amount = _safe_get_numeric(txn.get('amount'))
                 
-                # If party already exists from processor, use it directly
-                party_to_register = existing_party
+                # Extract party
+                party = _extract_party_from_narration(description)
+                if not party:
+                    party = _normalize_party(description.split()[0] if description else '')
                 
-                if not party_to_register or party_to_register in ['DEPOSIT', 'CASH', 'WITHDRAWAL', 'TRANSFER', 'UNKNOWN', '']:
-                    # Try fallback extraction
-                    fallback_party = _extract_party_from_narration(description)
-                    if fallback_party:
-                        party_to_register = fallback_party
-                        txn['detected_party'] = fallback_party
-                        txn['party'] = fallback_party
-                        party_extraction_stats['fallback'] += 1
-                    else:
-                        # Last resort: extract meaningful words from description
-                        words = description.replace('DEPOSIT', '').replace('PAYMENT', '').replace('CASH', '').replace('UTR', '').strip().split()
-                        meaningful = [w for w in words if len(w) > 2 and not w.isdigit()]
-                        if meaningful:
-                            party_to_register = ' '.join(meaningful[:3]).upper()
-                            txn['detected_party'] = party_to_register
-                            txn['party'] = party_to_register
-                            party_extraction_stats['fallback'] += 1
+                if party and party != "UNKNOWN":
+                    normalized = entity_normalizer._normalize_name(party)
+                    if normalized:
+                        entity_normalizer._register_entity(normalized, party, 'General', amount, is_credit, None)
+                        txn['party'] = normalized
+                        txn['detected_party'] = normalized
+                else:
+                    txn['party'] = "UNKNOWN"
+                    txn['detected_party'] = "UNKNOWN"
                 
-                if party_to_register and party_to_register not in ['DEPOSIT', 'CASH', 'WITHDRAWAL', 'TRANSFER', 'UNKNOWN', '']:
-                    party_extraction_stats['found'] += 1
-                    # Register party with entity_normalizer
-                    entity_normalizer.extract_entity(
-                        description,
-                        amount,
-                        is_credit=is_credit
-                    )
-                    # Get the registered party name (normalized)
-                    registered_party = entity_normalizer._normalize_name(party_to_register)
-                    if registered_party and registered_party in entity_normalizer.entities:
-                        txn['party'] = registered_party
-                        txn['detected_party'] = registered_party
-                    logger.debug(f"Registered party: {party_to_register}")
-                
-                # Categorize transaction (includes IMPS, RTGS)
+                # Get category WITHOUT overwriting the type!
                 category_data = categorizer.categorize_transaction(txn)
-                txn.update(category_data)
+                
+                # Update with category data BUT preserve original type!
+                for key, value in category_data.items():
+                    if key != 'type':  # Don't overwrite type from PDF!
+                        txn[key] = value
+                
+                # Ensure type is preserved
+                txn['type'] = original_type
                 
             except Exception as e:
                 logger.warning(f"Error processing transaction {idx}: {str(e)}")
                 continue
         
-        logger.info(f"Party extraction stats: {party_extraction_stats}")
+        # Validation
+        validated, validation_report = validation_engine.validate_transactions(transactions)
+        transactions = validated
         
-        # Build fund flow chains
+        # Balance analysis
+        balance_summary = analyze_statement_balance(transactions)
+        
+        # Fund flow
         fund_flow_builder.add_transactions(transactions, file.filename)
         fund_flow_builder.build_chains()
         
-        # Get party ledger summary
         party_ledger = entity_normalizer.get_party_ledger_summary()
-        
-        # Debug: log party ledger
-        logger.info(f"Party ledger: {len(party_ledger)} parties")
-        for party in party_ledger[:10]:
-            logger.info(f"  - {party['party_name']}: {party['transaction_count']} transactions, ₹{party['total_credit'] + party['total_debit']}")
-        
         fund_flow_chains = fund_flow_builder.get_chain_summary()
         entity_relations = entity_normalizer.get_entity_relation_index()
         
+        # Final count
+        final_credits = sum(1 for t in transactions if t.get('type') == 'CREDIT')
+        final_debits = sum(1 for t in transactions if t.get('type') == 'DEBIT')
+        logger.info(f"Final: {final_credits} CREDIT, {final_debits} DEBIT")
+        
         source_type = "pdf" if file.filename.lower().endswith('.pdf') else "xls"
         
-        response_data = {
+        return JSONResponse(content={
             "status": "success",
             "metadata": {
                 "filename": file.filename,
                 "total_transactions": len(transactions),
                 "analysis_timestamp": datetime.now().isoformat(),
                 "source": f"single_{source_type}",
-                "party_extraction_stats": party_extraction_stats
+                "credit_count": final_credits,
+                "debit_count": final_debits
             },
             "transactions": transactions,
-            "account_profile": account_profile,
+            "validation_report": validation_report.to_dict(),
+            "balance_summary": balance_summary.to_dict(),
             "party_ledger": {
                 "parties": party_ledger,
                 "total_parties": len(party_ledger),
@@ -355,21 +279,17 @@ async def analyze_statement(file: UploadFile = File(...)):
             },
             "fund_flow_chains": fund_flow_chains,
             "entity_relations": entity_relations
-        }
-        
-        logger.info(f"Analysis complete. Found {len(party_ledger)} parties, {fund_flow_chains.get('total_chains', 0)} fund flow chains")
-        
-        return JSONResponse(content=response_data)
+        })
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error processing file: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        logger.error(f"Error: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 
 @app.post("/api/analyze/multi")
 async def analyze_multiple_statements(files: List[UploadFile] = File(...)):
-    """Analyze multiple bank statement files simultaneously."""
+    """Analyze multiple bank statement files"""
     try:
         if not files or len(files) == 0:
             raise HTTPException(status_code=400, detail="No files provided")
@@ -388,27 +308,18 @@ async def analyze_multiple_statements(files: List[UploadFile] = File(...)):
                     return None, None, {}
                 
                 transactions = []
-                account_profile = {}
                 
                 if file.filename.lower().endswith(('.xls', '.xlsx')):
                     loop = asyncio.get_event_loop()
                     result = await loop.run_in_executor(
-                        None, 
-                        excel_processor.extract_transactions, 
-                        file_bytes,
-                        file.filename
+                        None, excel_processor.extract_transactions, file_bytes, file.filename
                     )
-                    
-                    if isinstance(result, tuple) and len(result) == 2:
-                        transactions, account_profile = result
-                    else:
-                        transactions = result if isinstance(result, list) else []
-                        account_profile = {}
-                
+                    transactions = _extract_transactions_safe(result)
                 elif file.filename.lower().endswith('.pdf'):
-                    transactions = pdf_processor.extract_transactions(file_bytes)
+                    result = pdf_processor.extract_transactions(file_bytes)
+                    transactions = _extract_transactions_safe(result)
                 
-                if not transactions or len(transactions) == 0:
+                if not transactions:
                     return None, None, {}
                 
                 for txn in transactions:
@@ -420,7 +331,7 @@ async def analyze_multiple_statements(files: List[UploadFile] = File(...)):
                     "transaction_count": len(transactions)
                 }
                 
-                return transactions, metadata, account_profile
+                return transactions, metadata, {}
                 
             except Exception as e:
                 logger.error(f"Error processing {file.filename}: {str(e)}")
@@ -431,102 +342,78 @@ async def analyze_multiple_statements(files: List[UploadFile] = File(...)):
         
         all_transactions = []
         file_metadata = []
-        combined_account_profile = {}
         
         for result in results:
             if isinstance(result, Exception):
                 continue
-            
-            transactions, metadata, account_profile = result
+            transactions, metadata, _ = result
             if transactions and metadata:
                 all_transactions.extend(transactions)
                 file_metadata.append(metadata)
-                if account_profile:
-                    for key, value in account_profile.items():
-                        if key not in combined_account_profile or not combined_account_profile[key]:
-                            combined_account_profile[key] = value
         
-        if not all_transactions or len(all_transactions) == 0:
-            raise HTTPException(status_code=400, detail="No transactions found in any file.")
+        if not all_transactions:
+            raise HTTPException(status_code=400, detail="No transactions found in any file")
         
-        logger.info(f"Total extracted: {len(all_transactions)} transactions from {len(file_metadata)} files")
+        logger.info(f"Total: {len(all_transactions)} transactions from {len(file_metadata)} files")
         
         entity_normalizer.clear()
         fund_flow_builder.clear()
         
-        party_extraction_stats = {'total': len(all_transactions), 'found': 0, 'fallback': 0}
-        
         for txn in all_transactions:
-            if txn.get('amount', 0) == 0:
-                txn['amount'] = (txn.get('credit', 0) or 0) - (txn.get('debit', 0) or 0)
-            
-            existing_party = txn.get('detected_party') or txn.get('party')
-            description = txn.get('description', '')
-            is_credit = txn.get('credit', 0) > 0
-            amount = txn.get('amount', 0)
-            
-            # If party already exists from processor, use it directly
-            party_to_register = existing_party
-            
-            if not party_to_register or party_to_register in ['DEPOSIT', 'CASH', 'WITHDRAWAL', 'TRANSFER', 'UNKNOWN', '']:
-                # Try fallback extraction
-                fallback_party = _extract_party_from_narration(description)
-                if fallback_party:
-                    party_to_register = fallback_party
-                    txn['detected_party'] = fallback_party
-                    txn['party'] = fallback_party
-                    party_extraction_stats['fallback'] += 1
-                else:
-                    # Last resort: extract meaningful words from description
-                    words = description.replace('DEPOSIT', '').replace('PAYMENT', '').replace('CASH', '').replace('UTR', '').strip().split()
-                    meaningful = [w for w in words if len(w) > 2 and not w.isdigit()]
-                    if meaningful:
-                        party_to_register = ' '.join(meaningful[:3]).upper()
-                        txn['detected_party'] = party_to_register
-                        txn['party'] = party_to_register
-                        party_extraction_stats['fallback'] += 1
-            
-            if party_to_register and party_to_register not in ['DEPOSIT', 'CASH', 'WITHDRAWAL', 'TRANSFER', 'UNKNOWN', '']:
-                party_extraction_stats['found'] += 1
-                # Register party with entity_normalizer
-                entity_normalizer.extract_entity(
-                    description,
-                    amount,
-                    is_credit=is_credit
-                )
-                # Get the registered party name (normalized)
-                registered_party = entity_normalizer._normalize_name(party_to_register)
-                if registered_party and registered_party in entity_normalizer.entities:
-                    txn['party'] = registered_party
-                    txn['detected_party'] = registered_party
-            
-            category_data = categorizer.categorize_transaction(txn)
-            txn.update(category_data)
+            try:
+                original_type = txn.get('type', 'UNKNOWN')
+                
+                txn['amount'] = _calculate_amount(txn)
+                is_credit = _is_credit_transaction(txn)
+                amount = _safe_get_numeric(txn.get('amount'))
+                description = txn.get('description', '')
+                
+                party = _extract_party_from_narration(description)
+                if not party:
+                    party = _normalize_party(description.split()[0] if description else '')
+                
+                if party and party != "UNKNOWN":
+                    normalized = entity_normalizer._normalize_name(party)
+                    if normalized:
+                        entity_normalizer._register_entity(normalized, party, 'General', amount, is_credit, None)
+                        txn['party'] = normalized
+                
+                # Get category without overwriting type
+                category_data = categorizer.categorize_transaction(txn)
+                for key, value in category_data.items():
+                    if key != 'type':
+                        txn[key] = value
+                
+                # Preserve original type
+                txn['type'] = original_type
+                
+            except Exception as e:
+                logger.warning(f"Error: {str(e)}")
         
-        logger.info(f"Party extraction stats (multi-file): {party_extraction_stats}")
+        # Validation
+        validated, validation_report = validation_engine.validate_transactions(all_transactions)
+        all_transactions = validated
         
         fund_flow_builder.add_transactions(all_transactions)
         fund_flow_builder.build_chains()
         
-        merged = entity_normalizer.auto_merge_similar_entities()
-        
         party_ledger = entity_normalizer.get_party_ledger_summary()
         fund_flow_chains = fund_flow_builder.get_chain_summary()
         entity_relations = entity_normalizer.get_entity_relation_index()
+        balance_summary = analyze_statement_balance(all_transactions)
         
-        response_data = {
+        return JSONResponse(content={
             "status": "success",
             "metadata": {
                 "files_processed": len(file_metadata),
                 "file_details": file_metadata,
                 "total_transactions": len(all_transactions),
                 "analysis_timestamp": datetime.now().isoformat(),
-                "source": "multi_file",
-                "auto_merged_entities": merged,
-                "party_extraction_stats": party_extraction_stats
+                "source": "multi_file"
             },
             "transactions": all_transactions,
-            "account_profile": combined_account_profile,
+            "validation_report": validation_report.to_dict(),
+            "balance_summary": balance_summary.to_dict(),
             "party_ledger": {
                 "parties": party_ledger,
                 "total_parties": len(party_ledger),
@@ -534,47 +421,38 @@ async def analyze_multiple_statements(files: List[UploadFile] = File(...)):
             },
             "fund_flow_chains": fund_flow_chains,
             "entity_relations": entity_relations
-        }
-        
-        logger.info(f"Analysis complete. Found {len(party_ledger)} parties")
-        
-        return JSONResponse(content=response_data)
+        })
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error processing files: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        logger.error(f"Error: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 
 @app.get("/api/party/{party_name}")
 async def get_party_details(party_name: str):
     try:
         normalized = entity_normalizer._normalize_name(party_name)
-        
         if normalized not in entity_normalizer.entities:
             raise HTTPException(status_code=404, detail=f"Party '{party_name}' not found")
         
         entity_data = entity_normalizer.entities[normalized]
-        money_paths = fund_flow_builder.get_money_path_by_party(party_name)
         
         return JSONResponse(content={
             "status": "success",
             "party": {
                 "name": normalized,
-                "entity_type": entity_data.get("entity_type", "Unknown"),
                 "transaction_count": entity_data["transaction_count"],
                 "total_credit": entity_data["total_credit"],
                 "total_debit": entity_data["total_debit"],
                 "net_flow": entity_data["total_credit"] - entity_data["total_debit"],
-                "upi_handles": list(entity_data.get("upi_handles", [])),
-                "money_paths": money_paths,
             }
         })
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error getting party details: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        logger.error(f"Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 
 @app.get("/api/fund-flow/chains")
 async def get_fund_flow_chains():
@@ -582,8 +460,8 @@ async def get_fund_flow_chains():
         chains = fund_flow_builder.get_chain_summary()
         return JSONResponse(content={"status": "success", "fund_flow_chains": chains})
     except Exception as e:
-        logger.error(f"Error getting fund flow chains: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        logger.error(f"Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 
 @app.get("/api/party-ledger")
 async def get_party_ledger():
@@ -592,35 +470,8 @@ async def get_party_ledger():
         statistics = entity_normalizer.get_statistics()
         return JSONResponse(content={"status": "success", "party_ledger": {"parties": party_ledger, "total_parties": len(party_ledger), "statistics": statistics}})
     except Exception as e:
-        logger.error(f"Error getting party ledger: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
-
-@app.get("/api/relations")
-async def get_party_relations():
-    try:
-        relations = entity_normalizer.get_entity_relation_index()
-        return JSONResponse(content={"status": "success", "relations": relations, "total_relations": len(relations)})
-    except Exception as e:
-        logger.error(f"Error getting relations: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
-
-@app.post("/api/export/json")
-async def export_analysis(format: str = Query("json")):
-    try:
-        party_ledger = entity_normalizer.get_party_ledger_summary()
-        fund_flow_chains = fund_flow_builder.get_chain_summary()
-        entity_relations = entity_normalizer.get_entity_relation_index()
-        
-        export_data = {"export_timestamp": datetime.now().isoformat(), "party_ledger": party_ledger, "fund_flow_chains": fund_flow_chains, "entity_relations": entity_relations}
-        return JSONResponse(content=export_data)
-    except Exception as e:
-        logger.error(f"Error exporting data: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
-
-@app.get("/api/report/{report_id}")
-async def get_report(report_id: str):
-    return {"message": "Report generation endpoint", "report_id": report_id}
+        logger.error(f"Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True, log_level="info")
-
