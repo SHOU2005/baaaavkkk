@@ -1,6 +1,6 @@
 """
 Universal Bank Statement PDF Analyzer
-Enhanced Credit/Debit Detection - Returns LIST ONLY
+Fixed Credit/Debit Detection - Prioritizes Amount Suffix
 """
 
 import re
@@ -26,73 +26,94 @@ def safe_float(val, default=0.0) -> float:
         return default
 
 
-def extract_amounts_from_text(text: str) -> List[float]:
-    """Extract all amounts from text"""
-    amounts = []
+def extract_amounts_from_text(text: str) -> List[Tuple[float, str]]:
+    """
+    Extract amounts with their suffix (Cr/Dr) from text.
+    Returns list of (amount, suffix) tuples.
+    """
+    results = []
     
-    # Currency patterns
-    currency_patterns = [r'[₹$€£¥]\s*([\d,]+\.?\d*)']
+    # Pattern: amount followed by Cr or Dr (with optional spaces)
+    # Matches: "9605.00 Cr", "26605.00Cr", "500.00 Cr", etc.
+    amount_with_suffix = re.findall(r'([\d,]+\.\d{2})\s*(Cr|Dr|CR|DR|cr|dr)\b', text)
     
-    for pattern in currency_patterns:
-        matches = re.findall(pattern, text)
-        for match in matches:
-            cleaned = re.sub(r'[,\s]', '', match)
-            try:
-                amount = float(cleaned)
-                if amount > 0:
-                    amounts.append(amount)
-            except ValueError:
-                continue
+    for amount_str, suffix in amount_with_suffix:
+        cleaned = re.sub(r'[,\s]', '', amount_str)
+        try:
+            amount = float(cleaned)
+            if amount > 0:
+                results.append((amount, suffix.upper()))
+        except ValueError:
+            continue
     
-    # Decimal patterns
-    decimal_matches = re.findall(r'([\d,]+\.\d{2})', text)
+    # Also extract amounts without suffix for fallback
+    decimal_matches = re.findall(r'([\d,]+\.\d{2})(?!\s*(?:Cr|Dr|CR|DR))', text)
     for match in decimal_matches:
         cleaned = re.sub(r'[,\s]', '', match)
         try:
             amount = float(cleaned)
             if 1 <= amount <= 999999:
-                amounts.append(amount)
+                # Check if this amount is followed by "Cr" or "Dr" nearby
+                pos = text.find(match)
+                if pos > 0:
+                    nearby = text[pos:pos+20]
+                    if 'Cr' in nearby or 'CR' in nearby:
+                        results.append((amount, 'CR'))
+                    elif 'Dr' in nearby or 'DR' in nearby:
+                        results.append((amount, 'DR'))
+                    else:
+                        results.append((amount, ''))
         except ValueError:
             continue
     
-    return amounts
+    return results
 
 
-def detect_transaction_type(text: str) -> Tuple[str, float]:
+def detect_transaction_type(text: str) -> Tuple[str, float, List[str]]:
     """
-    Detect if transaction is CREDIT or DEBIT based on multiple signals.
-    Returns (type, confidence)
+    Detect if transaction is CREDIT or DEBIT.
     
-    Priority order:
-    1. Explicit CR/DR patterns (last occurrence wins)
-    2. Keywords (SALARY, DEPOSIT, RECEIVED = CREDIT)
-    3. Keywords (PAID, WITHDRAWAL, TRANSFER TO = DEBIT)
-    4. Balance direction inference
+    Priority:
+    1. Amount suffix (Cr/Dr) - MOST RELIABLE
+    2. CR/DR in narration (position-based)
+    3. Keywords
     """
     text_upper = text.upper()
-    
-    credit_signals = 0.0
-    debit_signals = 0.0
     reasons = []
     
-    # ==== 1. CR/DR PATTERNS (highest priority) ====
-    # Find ALL CR and DR occurrences and use the LAST one
+    # ==== 1. CHECK AMOUNT SUFFIX FIRST (most reliable) ====
+    amounts_with_suffix = extract_amounts_from_text(text)
     
-    # CR patterns
-    cr_patterns = [
-        r'\bCR\b',           # CR as word
-        r'\bCr\.\b',         # Cr. with period
-        r'\bCREDIT\b',       # CREDIT keyword
-        r'/CR/',             # /CR/ UPI pattern
-    ]
+    # Look for amounts with Cr or Dr suffix
+    credit_amounts = []
+    debit_amounts = []
+    unknown_amounts = []
     
-    # DR patterns  
-    dr_patterns = [
-        r'\bDR\b',           # DR as word
-        r'\bDr\.\b',         # Dr. with period
-        r'\bDEBIT\b',        # DEBIT keyword
-        r'/DR/',             # /DR/ UPI pattern
-    ]
+    for amount, suffix in amounts_with_suffix:
+        if suffix == 'CR':
+            credit_amounts.append(amount)
+        elif suffix == 'DR':
+            debit_amounts.append(amount)
+        else:
+            unknown_amounts.append(amount)
+    
+    # If we found credit amounts, this is a credit transaction
+    if credit_amounts:
+        txn_type = "CREDIT"
+        confidence = 3.0
+        reasons.append(f"amount suffix Cr: {credit_amounts[0]}")
+        return txn_type, confidence, reasons
+    
+    # If we found debit amounts, this is a debit transaction
+    if debit_amounts:
+        txn_type = "DEBIT"
+        confidence = 3.0
+        reasons.append(f"amount suffix Dr: {debit_amounts[0]}")
+        return txn_type, confidence, reasons
+    
+    # ==== 2. CHECK CR/DR PATTERNS (last occurrence wins) ====
+    cr_patterns = [r'\bCR\b', r'/CR/', r'\bCr\.\b']
+    dr_patterns = [r'\bDR\b', r'/DR/', r'\bDr\.\b']
     
     cr_positions = []
     dr_positions = []
@@ -109,92 +130,58 @@ def detect_transaction_type(text: str) -> Tuple[str, float]:
     last_dr = max([p[0] for p in dr_positions]) if dr_positions else -1
     
     if last_cr > last_dr:
-        credit_signals += 3.0
         reasons.append(f"CR at position {last_cr}")
+        # Verify this isn't just a UPI reference number
+        # UPI references often look like: UPI/DR/123456 - the DR here is reference, not type
+        # If CR comes after DR, use CR. If CR comes before DR, we need to look closer
+        return "CREDIT", 2.5, reasons
     elif last_dr > last_cr:
-        debit_signals += 3.0
         reasons.append(f"DR at position {last_dr}")
+        return "DEBIT", 2.5, reasons
     
-    # ==== 2. CREDIT KEYWORDS ====
+    # ==== 3. CHECK KEYWORDS ====
     credit_keywords = [
-        (r'SALARY', 2.5),
-        (r'SALARY\s+CR', 3.0),
-        (r'INCOME', 2.0),
-        (r'DEPOSIT', 2.0),
-        (r'DEPOSITED', 2.0),
-        (r'RECEIVED', 2.0),
-        (r'REFUND', 2.5),
-        (r'REVERSAL', 2.0),
-        (r'CHARGEBACK', 2.5),
-        (r'INTEREST', 2.0),
-        (r'DIVIDEND', 2.0),
-        (r'REWARD', 2.0),
-        (r'CASHBACK', 2.5),
-        (r'LOAN', 2.5),
-        (r'CREDIT\s+NOTE', 2.5),
+        (r'SALARY', 2.0), (r'DEPOSIT', 2.0), (r'RECEIVED', 2.0),
+        (r'REFUND', 2.0), (r'INTEREST', 2.0), (r'DIVIDEND', 2.0),
+        (r'CASHBACK', 2.0), (r'BONUS', 2.0), (r'LOAN', 2.0),
     ]
+    
+    debit_keywords = [
+        (r'PAID', 2.0), (r'PAID\s+TO', 2.5), (r'WITHDRAWAL', 2.0),
+        (r'\sWDL\s', 2.0), (r'TRANSFER\s+TO', 2.0), (r'TO\s+[A-Z]', 1.5),
+        (r'EMI', 2.0), (r'BILL', 1.5), (r'CHARGES', 1.5),
+    ]
+    
+    credit_signals = 0.0
+    debit_signals = 0.0
     
     for pattern, weight in credit_keywords:
         if re.search(pattern, text_upper):
             credit_signals += weight
             reasons.append(f"credit keyword: {pattern}")
     
-    # ==== 3. DEBIT KEYWORDS ====
-    debit_keywords = [
-        (r'PAID', 2.5),
-        (r'PAID\s+TO', 3.0),
-        (r'PAYMENT', 2.0),
-        (r'PAYMENT\s+TO', 2.5),
-        (r'WITHDRAWAL', 2.5),
-        (r'WITHDRAW', 2.5),
-        (r'\sWDL\s', 2.5),
-        (r'ATM', 1.5),
-        (r'CASH\s+WITHDRAWAL', 3.0),
-        (r'TRANSFER\s+TO', 2.5),
-        (r'TO\s+[A-Z]', 1.5),
-        (r'EMI', 2.5),
-        (r'BILL', 2.0),
-        (r'CHARGES', 2.0),
-        (r'FEE', 2.0),
-        (r'TAX', 2.0),
-        (r'IMPS', 1.5),
-        (r'NEFT', 1.5),
-        (r'RTGS', 1.5),
-        (r'UPI\s+[T|P]', 2.0),
-    ]
-    
     for pattern, weight in debit_keywords:
         if re.search(pattern, text_upper):
             debit_signals += weight
             reasons.append(f"debit keyword: {pattern}")
     
-    # ==== 4. TRANSACTION CONTEXT ====
-    # "TRANSFER TO" is debit, "TRANSFER FROM" is credit
-    if re.search(r'TRANSFER\s+TO', text_upper):
-        debit_signals += 2.0
-        reasons.append("transfer to")
-    elif re.search(r'TRANSFER\s+FROM', text_upper):
-        credit_signals += 2.0
-        reasons.append("transfer from")
-    
-    # ==== DETERMINE RESULT ====
     if credit_signals > debit_signals:
-        return "CREDIT", credit_signals
+        return "CREDIT", credit_signals, reasons
     elif debit_signals > credit_signals:
-        return "DEBIT", debit_signals
-    else:
-        # Tie - default to DEBIT but log warning
-        return "DEBIT", 1.0
+        return "DEBIT", debit_signals, reasons
+    
+    # ==== 4. DEFAULT ====
+    # If no clear indicator, default to DEBIT
+    reasons.append("default to DEBIT")
+    return "DEBIT", 1.0, reasons
 
 
 class PDFProcessor:
-    """PDF processor - returns LIST ONLY with accurate credit/debit detection"""
+    """PDF processor - Accurate credit/debit detection"""
     
     DATE_REGEX = re.compile(
         r'\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{1,2}-[A-Za-z]{3}-\d{2,4})\b'
     )
-    
-    AMOUNT_REGEX = re.compile(r'[\d,]+\.\d{2}')
     
     SKIP_WORDS = {
         "UPI", "IMPS", "NEFT", "RTGS", "DR", "CR", "DEBIT", "CREDIT",
@@ -272,32 +259,45 @@ class PDFProcessor:
         """Parse a transaction block"""
         text = " ".join(block)
         
+        # Detect transaction type FIRST (this uses amount suffix)
+        txn_type, confidence, detection_reasons = detect_transaction_type(text)
+        
         # Extract amounts
-        amounts = extract_amounts_from_text(text)
+        amounts_with_suffix = extract_amounts_from_text(text)
         
-        if len(amounts) == 0:
-            legacy_amounts = [float(a.replace(",", "")) for a in self.AMOUNT_REGEX.findall(text)]
-            if len(legacy_amounts) > 0:
-                amounts = [a for a in legacy_amounts if 1 <= a <= 999999]
+        # Separate credit and debit amounts
+        credit_amounts = [a for a, s in amounts_with_suffix if s == 'CR']
+        debit_amounts = [a for a, s in amounts_with_suffix if s == 'DR']
+        other_amounts = [a for a, s in amounts_with_suffix if s == '']
         
-        # Detect transaction type
-        txn_type, confidence = detect_transaction_type(text)
-        
-        # Assign amounts based on type
+        # Assign amounts based on detected type
         debit = 0.0
         credit = 0.0
         balance = 0.0
         
-        if len(amounts) >= 1:
-            if txn_type == "CREDIT":
-                credit = amounts[0]
-            else:  # DEBIT
-                debit = amounts[0]
-        
-        if len(amounts) >= 2:
-            balance = amounts[1]
-        elif len(amounts) >= 3:
-            balance = amounts[-1]
+        if txn_type == "CREDIT":
+            # Use credit amounts, or first other amount
+            if credit_amounts:
+                credit = credit_amounts[0]
+            elif other_amounts:
+                credit = other_amounts[0]
+            
+            # Balance is typically the last amount
+            all_amounts = [a for a, _ in amounts_with_suffix]
+            if len(all_amounts) >= 2:
+                balance = all_amounts[-1]
+                
+        else:  # DEBIT
+            # Use debit amounts, or first other amount
+            if debit_amounts:
+                debit = debit_amounts[0]
+            elif other_amounts:
+                debit = other_amounts[0]
+            
+            # Balance is typically the last amount
+            all_amounts = [a for a, _ in amounts_with_suffix]
+            if len(all_amounts) >= 2:
+                balance = all_amounts[-1]
         
         # Calculate net amount
         if credit > 0:
@@ -321,7 +321,8 @@ class PDFProcessor:
             "balance": balance,
             "amount": amount,
             "source": "pdf",
-            "detection_confidence": confidence
+            "detection_confidence": confidence,
+            "detection_reasons": detection_reasons
         }
     
     def _extract_party(self, text: str) -> str:
@@ -329,9 +330,11 @@ class PDFProcessor:
         text = text.upper()
         
         patterns = [
-            r'UPI/(?:CR|DR)/\d+/([A-Z\s]+)',
-            r'IMPS/\d+/([A-Z\s]+)',
-            r'NEFT/([A-Z\s]+)',
+            r'UPI/\w+/([A-Z]+)',  # UPI/DR/123456/PARTYNAME
+            r'PYTM[0-9]*/([A-Z]+)',  # PYTM + number + name
+            r'SBIN[0-9]*/([A-Z]+)',  # SBIN reference
+            r'UTIB[0-9]*/([A-Z]+)',  # UTIB reference
+            r'ICIC[0-9]*/([A-Z]+)',  # ICIC reference
             r'TRANSFER\s+TO\s+([A-Z\s]+)',
             r'FROM\s+([A-Z\s]+)',
             r'PAID\s+TO\s+([A-Z\s]+)',
@@ -341,14 +344,17 @@ class PDFProcessor:
         for p in patterns:
             m = re.search(p, text)
             if m:
-                return self._clean_party(m.group(1))
+                party = self._clean_party(m.group(1))
+                if party and party not in ["UNKNOWN", "PYTM", "SBIN", "UTIB", "ICIC"]:
+                    return party
         
+        # Fallback: extract meaningful words
         words = [
             w for w in text.split()
             if w.isalpha() and len(w) > 3 and w not in self.SKIP_WORDS
         ]
         
-        return " ".join(words[:4]) if words else "UNKNOWN"
+        return " ".join(words[:3]) if words else "UNKNOWN"
     
     def _clean_party(self, name: str) -> str:
         """Clean party name"""
@@ -359,7 +365,7 @@ class PDFProcessor:
         """Clean transaction description"""
         text = self.DATE_REGEX.sub("", text)
         text = re.sub(r'[₹$€£¥]\s*[\d,]+\.?\d*', '', text)
-        text = re.sub(r'[\d,]+\.\d{2}', '', text)
+        text = re.sub(r'[\d,]+\.\d{2}\s*(?:Cr|Dr)?', '', text)
         return " ".join(text.split()).strip()
     
     def _normalize_date(self, raw: str) -> str:
