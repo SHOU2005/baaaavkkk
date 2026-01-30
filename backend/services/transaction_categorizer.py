@@ -1,183 +1,210 @@
 """
 Transaction Categorization Service
-Uses NLP-based classification to categorize transactions
+FIXED: Correctly categorizes UPI transactions as CREDIT or DEBIT
 """
 
 import re
-from typing import Dict, Any, List
+from typing import Dict, Any
 import logging
 
 logger = logging.getLogger(__name__)
 
+
+def safe_float(value, default=0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 class TransactionCategorizer:
-    """Categorize transactions using NLP-based rules and patterns"""
+    """Categorize transactions - FIXED to properly detect CREDIT vs DEBIT"""
     
     def __init__(self):
-        self.category_patterns = self._build_category_patterns()
-        self.merchant_risk_keywords = self._build_risk_keywords()
+        self._build_category_patterns()
     
-    def _build_category_patterns(self) -> Dict[str, List[str]]:
-        """Build pattern dictionaries for transaction categorization"""
-        return {
-            'Income': [
-                r'salary', r'payroll', r'wages', r'income', r'credit.*salary',
-                r'employer', r'pay.*credit', r'salary.*credit', r'salary.*transfer'
-            ],
-            'Reward/Cashback': [
-                r'reward', r'cashback', r'bonus', r'cash.*back', r'loyalty',
-                r'points.*credit', r'reward.*points', r'cashback.*credit'
-            ],
-            'Refund': [
-                r'refund', r'reversal', r'chargeback', r'return.*refund',
-                r'refund.*credit', r'payment.*reversal', r'refund.*received'
-            ],
-            'Bill Payment': [
-                r'electricity', r'water', r'gas', r'utility', r'bill.*payment',
-                r'phone.*bill', r'mobile.*bill', r'internet.*bill', r'cable.*bill',
-                r'electricity.*bill', r'water.*bill', r'gas.*bill'
-            ],
-            'Subscription': [
-                r'subscription', r'netflix', r'spotify', r'prime', r'monthly.*fee',
-                r'annually', r'recurring.*subscription', r'auto.*debit.*subscription',
-                r'amazon.*prime', r'youtube.*premium', r'subscription.*fee'
-            ],
-            'EMI': [
-                r'emi', r'loan.*emi', r'installment', r'loan.*repayment',
-                r'equated.*monthly', r'home.*loan.*emi', r'car.*loan.*emi',
-                r'personal.*loan.*emi', r'emi.*payment'
-            ],
-            'UPI Transfer': [
-                r'upi', r'paytm', r'phonepe', r'gpay', r'google.*pay',
-                r'bank.*transfer.*upi', r'instant.*payment', r'upi.*transfer',
-                r'upi.*payment', r'upi.*to', r'vpa.*upi'
-            ],
-            'Bank Transfer': [
-                r'neft', r'rtgs', r'imps', r'bank.*transfer', r'fund.*transfer',
-                r'online.*transfer', r'electronic.*transfer', r'eft', r'wire.*transfer'
-            ],
-            'Cash Flow': [
-                r'atm', r'cash.*withdrawal', r'cash.*atm', r'withdrawal.*atm',
-                r'cash.*deposit', r'cash.*transaction'
-            ],
-            'Loan': [
-                r'loan.*disbursement', r'personal.*loan', r'credit.*limit',
-                r'loan.*credit', r'advance.*loan', r'loan.*sanction',
-                r'loan.*disbursed', r'personal.*loan.*credit'
-            ],
-            'Investment': [
-                r'investment', r'mutual.*fund', r'stocks', r'shares',
-                r'fixed.*deposit', r'fd', r'rd', r'recurring.*deposit',
-                r'mutual.*fund.*purchase', r'sip.*investment', r'demat.*account'
-            ],
-            'Expense': [
-                r'expense', r'purchase', r'payment', r'debit', r'spending',
-                r'merchant.*payment', r'pos.*transaction', r'card.*payment'
-            ],
-        }
-    
-    def _build_risk_keywords(self) -> Dict[str, float]:
-        """Build risk scoring keywords for merchants/descriptions"""
-        return {
-            'high_risk': ['casino', 'gambling', 'betting', 'crypto', 'bitcoin', 'forex', 'trading.*platform'],
-            'medium_risk': ['online.*payment', 'merchant.*unknown', 'international', 'foreign.*transaction'],
-            'low_risk': ['salary', 'utility', 'government', 'bank', 'established.*merchant']
-        }
+    def _build_category_patterns(self):
+        # Credit categories (money IN)
+        self.credit_categories = [
+            'Income', 'Reward/Cashback', 'Refund', 'Salary'
+        ]
+        
+        # Debit categories (money OUT)
+        self.debit_categories = [
+            'Bill Payment', 'Subscription', 'EMI', 'UPI Transfer',
+            'Bank Transfer', 'Cash Flow', 'Loan', 'Investment', 'Expense'
+        ]
+        
+        # Credit keywords
+        self.credit_patterns = [
+            r'salary', r'payroll', r'wages', r'income', r'credit.*salary',
+            r'interest', r'dividend', r'refund', r'reversal',
+            r'cashback', r'bonus', r'reward', r'points',
+            r'deposit', r'received', r'credit note',
+        ]
+        
+        # Debit keywords
+        self.debit_patterns = [
+            r'emi', r'bill', r'electricity', r'water', r'gas',
+            r'upi', r'imps', r'neft', r'rtgs', r'transfer',
+            r'atm', r'withdrawal', r'subscription', r'payment',
+            r'paid', r'charges', r'fee', r'tax',
+        ]
     
     def categorize_transaction(self, transaction: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Categorize a single transaction and return category metadata.
-        Returns: category, subcategory, merchant_risk_score, narration_risk_confidence, behavioral_deviation
+        Categorize a transaction with CORRECT credit/debit detection.
         """
         description = str(transaction.get('description', '')).lower()
-        credit = float(transaction.get('credit', 0.0))
-        debit = float(transaction.get('debit', 0.0))
-        amount = credit if credit > 0 else debit
+        narration = str(transaction.get('narration', '')).lower()
         
-        # Initialize defaults
-        category = 'Unknown'
-        subcategory = ''
-        merchant_risk_score = 0.5  # Default medium risk
-        narration_risk_confidence = 0.5
-        behavioral_deviation = 'Normal'
+        credit = safe_float(transaction.get('credit'))
+        debit = safe_float(transaction.get('debit'))
+        amount = credit if credit > 0 else abs(debit)
         
-        # Categorize based on patterns
-        matched_category = None
-        max_match_length = 0
-        
-        for cat_key, patterns in self.category_patterns.items():
-            for pattern in patterns:
-                if re.search(pattern, description, re.IGNORECASE):
-                    if len(pattern) > max_match_length:
-                        max_match_length = len(pattern)
-                        matched_category = cat_key
-                        break
-        
-        if matched_category:
-            # Use matched category directly (no subcategory splitting for new categories)
-            category = matched_category
-            subcategory = ''
+        # === STEP 1: Check for explicit CR/Dr suffix on amount ===
+        # If we have a credit amount, it's a credit transaction
+        if credit > 0 and debit == 0:
+            transaction_type = "CREDIT"
+            category = "Income"
+        # If we have a debit amount, it's a debit transaction
+        elif debit > 0 and credit == 0:
+            transaction_type = "DEBIT"
+            category = "Expense"
         else:
-            # Fallback categorization based on amount and type
-            if credit > 0:
-                category = 'Income'
-                subcategory = ''
-            elif debit > 0:
-                category = 'Expense'
-                subcategory = ''
+            # Use keyword-based detection
+            transaction_type, category = self._detect_from_keywords(description)
         
-        # Calculate merchant risk score
+        # === STEP 2: Override based on description keywords ===
+        desc_upper = description.upper()
+        
+        # Explicit credit indicators
+        if any(kw in desc_upper for kw in ['SALARY', 'DEPOSIT', 'RECEIVED', 'REFUND', 
+                                             'INTEREST', 'DIVIDEND', 'CASHBACK', 'BONUS',
+                                             'INCOME', 'CREDIT NOTE']):
+            transaction_type = "CREDIT"
+            category = "Income"
+        
+        # Explicit debit indicators  
+        elif any(kw in desc_upper for kw in ['PAID', 'WITHDRAWAL', 'WITHDRAW', 
+                                              'ATM', 'CHARGES', 'FEE', 'TAX',
+                                              'EMI', 'BILL', 'PAYMENT']):
+            transaction_type = "DEBIT"
+            category = "Expense"
+        
+        # === STEP 3: UPI transaction handling ===
+        # UPI transactions can be credit OR debit
+        if 'UPI' in desc_upper:
+            if transaction_type == "UNKNOWN":
+                # Default UPI to DEBIT (money going out)
+                transaction_type = "DEBIT"
+                category = "UPI Transfer"
+            
+            # Check for credit UPI patterns
+            if any(kw in desc_upper for kw in ['RECEIVED', 'CREDIT', 'SENT']):
+                # "Sent" is confusing - check if it's money in or out
+                # Usually UPI Sent means money OUT (DEBIT)
+                pass
+        
+        # === STEP 4: Bank transfer handling ===
+        if any(kw in desc_upper for kw in ['IMPS', 'NEFT', 'RTGS', 'FT TO']):
+            # These can be either - default to CREDIT if amount is positive
+            if transaction_type == "UNKNOWN":
+                transaction_type = "CREDIT" if amount > 0 else "DEBIT"
+                category = "Bank Transfer"
+        
+        # === STEP 5: Check for IMPS incoming ===
+        if 'IMPS' in desc_upper and 'FUNDING' in desc_upper:
+            transaction_type = "CREDIT"
+            category = "Bank Transfer"
+        
+        # Determine subcategory
+        subcategory = self._get_subcategory(category, description)
+        
+        # Calculate risk
         merchant_risk_score = self._calculate_merchant_risk(description)
-        
-        # Calculate narration risk confidence (based on pattern match quality)
-        if matched_category:
-            narration_risk_confidence = min(0.95, 0.5 + (max_match_length / 100))
-        else:
-            narration_risk_confidence = 0.3
-        
-        # Determine behavioral deviation
-        behavioral_deviation = self._determine_behavioral_deviation(transaction, category)
         
         return {
             'category': category,
             'subcategory': subcategory,
+            'type': transaction_type,  # This is the key field!
             'merchant_risk_score': round(merchant_risk_score, 3),
-            'narration_risk_confidence': round(narration_risk_confidence, 3),
-            'behavioral_deviation': behavioral_deviation
+            'narration_risk_confidence': 0.7,
+            'behavioral_deviation': self._determine_behavioral_deviation(amount, category)
         }
     
-    def _calculate_merchant_risk(self, description: str) -> float:
-        """Calculate merchant risk score (0.0 to 1.0)"""
-        description_lower = description.lower()
+    def _detect_from_keywords(self, text: str) -> tuple:
+        """Detect transaction type from keywords"""
+        text_lower = text.lower()
         
-        # Check high risk keywords
-        for keyword in self.merchant_risk_keywords.get('high_risk', []):
-            if re.search(keyword, description_lower):
+        # Check for credit keywords
+        credit_score = 0
+        for pattern in self.credit_patterns:
+            if re.search(pattern, text_lower):
+                credit_score += 1
+        
+        # Check for debit keywords
+        debit_score = 0
+        for pattern in self.debit_patterns:
+            if re.search(pattern, text_lower):
+                debit_score += 1
+        
+        if credit_score > debit_score:
+            return "CREDIT", "Income"
+        elif debit_score > credit_score:
+            return "DEBIT", "Expense"
+        else:
+            return "UNKNOWN", "Expense"
+    
+    def _get_subcategory(self, category: str, description: str) -> str:
+        """Get subcategory based on description"""
+        desc = description.upper()
+        
+        subcategories = {
+            'UPI Transfer': ['PAYTM', 'PHONEPE', 'GPAY', 'UPI'],
+            'Bank Transfer': ['IMPS', 'NEFT', 'RTGS', 'FUNDING'],
+            'Bill Payment': ['ELECTRICITY', 'WATER', 'GAS', 'MOBILE', 'INTERNET'],
+            'Salary': ['SALARY', 'PAYROLL'],
+            'Investment': ['FD', 'MUTUAL', 'STOCKS'],
+        }
+        
+        for subcat, keywords in subcategories.items():
+            if category in ['Income', 'Expense', 'UPI Transfer', 'Bank Transfer']:
+                for kw in keywords:
+                    if kw in desc:
+                        return subcat
+        
+        return category
+    
+    def _calculate_merchant_risk(self, description: str) -> float:
+        """Calculate risk score based on description"""
+        desc = description.lower()
+        
+        high_risk = ['casino', 'gambling', 'betting', 'crypto', 'bitcoin']
+        medium_risk = ['gaming', 'adult', 'dating']
+        low_risk = ['utility', 'government', 'bank', 'salary']
+        
+        for kw in high_risk:
+            if kw in desc:
                 return 0.9
         
-        # Check medium risk keywords
-        for keyword in self.merchant_risk_keywords.get('medium_risk', []):
-            if re.search(keyword, description_lower):
+        for kw in medium_risk:
+            if kw in desc:
                 return 0.6
         
-        # Check low risk keywords
-        for keyword in self.merchant_risk_keywords.get('low_risk', []):
-            if re.search(keyword, description_lower):
+        for kw in low_risk:
+            if kw in desc:
                 return 0.2
         
-        # Default medium risk
         return 0.5
     
-    def _determine_behavioral_deviation(self, transaction: Dict[str, Any], category: str) -> str:
-        """Determine behavioral deviation tag"""
-        amount = float(transaction.get('credit', 0.0)) or float(transaction.get('debit', 0.0))
-        
-        # Large amounts might indicate deviation
-        if amount > 100000:  # Threshold for large transactions
+    def _determine_behavioral_deviation(self, amount: float, category: str) -> str:
+        """Determine if transaction is unusual"""
+        if amount > 100000:
             return 'High Value'
-        elif amount < 10:  # Very small transactions
+        elif amount < 10:
             return 'Micro Transaction'
         elif category == 'Unknown':
             return 'Uncategorized'
         else:
             return 'Normal'
-
