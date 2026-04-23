@@ -41,6 +41,12 @@ ALLOWED_ORIGINS: list[str] = [o.strip() for o in _raw_origins.split(",") if o.st
 if not ALLOWED_ORIGINS:
     ALLOWED_ORIGINS = ["http://localhost:3000", "http://localhost:5173"]
 
+# Regex covers every Vercel preview URL (*.vercel.app) + localhost variants
+CORS_ORIGIN_REGEX = os.getenv(
+    "CORS_ORIGIN_REGEX",
+    r"https://.*\.vercel\.app|http://localhost:\d+|http://127\.0\.0\.1:\d+"
+)
+
 # ── File upload limits ────────────────────────────────────────────────────────
 MAX_FILE_SIZE_BYTES = int(os.getenv("MAX_FILE_SIZE_MB", "25")) * 1024 * 1024
 MAX_FILES_PER_REQUEST = int(os.getenv("MAX_FILES_PER_REQUEST", "10"))
@@ -61,6 +67,7 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=CORS_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "Accept", "X-Requested-With"],
