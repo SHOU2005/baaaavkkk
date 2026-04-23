@@ -1,3 +1,6 @@
+# Root-level Dockerfile for Render deployment
+# Copy of backend/Dockerfile for platforms that expect Dockerfile at root
+
 FROM python:3.11-slim
 
 # Set working directory
@@ -16,14 +19,14 @@ ENV PYTHONUNBUFFERED=1
 ENV PORT=8000
 
 # Copy requirements first for better caching
-COPY requirements.txt .
+COPY backend/requirements.txt requirements.txt
 
 # Install Python dependencies
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
-COPY . .
+# Copy application code from backend directory
+COPY backend/ .
 
 # Create required directories
 RUN mkdir -p /app/logs && chmod -R 777 /app/logs
